@@ -1,0 +1,517 @@
+#!/bin/bash
+#:        nome : pgn_gui
+#:        data : 22.04.2018
+#:  dipendenze : jq pgn-extract spacefm xdotool
+#dtmp="${0%/*}"
+
+
+#echo "${0%/*}/temp"
+#echo $0
+#exit
+
+function archive_import { # dal file sorgente PGN alle partite validate e archiviate
+    # init params
+    local pname=$1 # nome programma
+    local dtmp=$2 # directory temporanea
+    local ddb="$3" # directory archivio
+
+    ## selezione file PGN sorgente
+    # win2: init
+    local dsrc=${dtmp}/win2_chooser1; [[ -s $dsrc && -d $( <$dsrc ) ]] || echo "/dev/shm" >$dsrc
+    # named-pipe
+    local fcmd=${dtmp}/win2_cmd
+    [[ -e $fcmd ]] && rm -f $fcmd
+    mkfifo $fcmd
+
+    # win2: open
+    eval "$( spacefm --dialog \
+      --window-size "960x800 4" --title "Importa un file PGN... - ${pname}" --window-icon "$pname" \
+      --chooser --filter "*.pgn" @$dsrc \
+      --hsep \
+      --button 'cancel' -- close \
+      --button 'open' \
+      --command $fcmd )"
+    rm -f $fcmd
+
+    # annullato o scelta nulla?
+    [[ $dialog_pressed_index -eq 1 && -s $dialog_chooser1 ]] || return
+
+    # init file temporanei e variabili
+    local fabort=${dtmp}/abort_flag; [[ -e $fabort ]] && rm -f $fabort
+    local flog=${dtmp}/import.log; [[ -e $flog ]] && rm -f $flog
+    local fgames=${dtmp}/games.json; [[ -e $fgames ]] && rm -f $fgames
+    local fpgn_tmp=${dtmp}/import_tmp.pgn; [[ -e $fpgn_tmp ]] && rm -f $fpgn_tmp
+    local fjson_tmp=${dtmp}/import_tmp.json; [[ -e $fjson_tmp ]] && rm -f $fjson_tmp
+    # NOTA: pongo un limite predefinito al numero di partite importabili per singolo file PGN
+    local games_limit=10000
+
+    # durante l'importazione sarà visibile il dialogo 'busy'
+    # win3: init
+    >${dtmp}/win3_label4
+    >${dtmp}/win3_label6
+    # named-pipe
+    fcmd=${dtmp}/win3_cmd
+    [[ -e $fcmd ]] && rm -f $fcmd
+    mkfifo $fcmd
+
+    # win3: open
+    ( spacefm --dialog \
+        --window-size "800x-1 4" --title "processo in corso... - ${pname}" --window-icon "$pname" \
+        --window-close -- press button1 \
+        --label --nowrap --font '15' "~<span foreground='#0E520E'>♔ IMPORTAZIONE DI UN NUOVO FILE <tt>PGN</tt></span>" \
+        --hbox --compact 0 \
+          --label --nowrap --font '11' "~<span foreground='#66501A'>     filename:</span>" \
+          --label --nowrap --font 'monospace bold 13' "${dialog_chooser1##*/}" \
+        --close-box \
+        --hsep \
+        --vbox \
+          --label --nowrap --font 'italic 12' @${dtmp}/win3_label4 \
+          --progress pulse \
+          --vbox  \
+            --label --nowrap --font 'bold 13' "~<span foreground='#BD3C14'>❢ elaborazione interrotta e annullata</span>" \
+            --label --nowrap --font 'bold 12' @${dtmp}/win3_label6 \
+          --close-box \
+        --close-box \
+        --button "stop" -- noop "%( killall -q 'pgn-extract'; >$fabort )" -- close \
+        --button "Chiudi :window-close-symbolic" -- press button1 \
+        --command $fcmd -- hide vbox2 -- hide button2 -- set windowsize '800x1' >/dev/null 2>&1
+      rm -f $fcmd
+    ) &
+
+    ## elaboro in 5 passaggi..
+    local ec=
+    local res=
+
+    # ~~ processo 1/5
+    [[ -f $fabort ]] && return
+    res="$( LC_ALL=en_US.UTF-8 printf "%'.f\n" $games_limit )"
+    echo "~ <b>1</b>/5 - validazione e calcolo hash delle singole partite <small> ❲o delle prime ${res//,/.} quale numero massimo predefinito❳</small>..." >${dtmp}/win3_label4
+    pgn-extract --quiet --fixresulttags --nobadresults --nocomments --noduplicates --stopafter $games_limit --addhashcode -o${fpgn_tmp} -l${flog} "$dialog_chooser1"
+    ec=$?
+    if [[ $ec -ne 0 ]]; then
+      echo -e "set label6 ~     ERRORE: il programma  <tt>pgn-extract</tt>  è uscito con codice ${ec}\nhide progress1\nhide button1\nshow vbox2\nshow button2" >$fcmd
+      return
+    fi
+
+    # $fpgn_tmp esiste e contiene almeno una partita convalidata?
+    res="$( grep -sic -- '^\[hashcode\s' $fpgn_tmp )"; [[ $res =~ ^[0-9]+$ ]] || res=0
+    if [[ $res -eq 0 ]]; then
+      echo -e "set label6 ~     nessuna partita convalidata, nulla da importare\nhide progress1\nhide button1\nshow vbox2\nshow button2" >$fcmd
+      return
+    fi
+
+    # ~~ processo 2/5
+    [[ -f $fabort ]] && return
+    echo "~ <b>2</b>/5 - calcolo di hash MD5 per il file PGN estratto e controllo per evitare un duplicato..." >${dtmp}/win3_label4
+    local fhash="$( md5sum $fpgn_tmp )"; fhash="${fhash%% *}"
+
+    # file già in archivio?
+    if [[ -s ${ddb}/${fhash}.pgn ]]; then
+      echo -e "set label6 ~     questi stessi contenuti sono già presenti in archivio\nhide progress1\nhide button1\nshow vbox2\nshow button2" >$fcmd
+      return
+    fi
+
+    # ~~ processo 3/5
+    [[ -f $fabort ]] && return
+    echo "~ <b>3</b>/5 - traduzione in JSON delle coppie  <tt>[Tag \"valore\"]</tt>..." >${dtmp}/win3_label4
+    # NOTA¹: l'opzione --json produce un documento NON VALIDO con qualsiasi formattazione output che non sia 'uci'
+    # NOTA²: non ho bisogno di conservare anche un duplicato delle mosse perciò subito rimuovo i relativi array
+    pgn-extract --quiet -Wuci --json -l/dev/null $fpgn_tmp | jq -c 'map(del(.Moves))' >$fgames 2>${flog}
+
+    # $fgames valido?
+    local ngames="$( jq 'length' $fgames )"; [[ $ngames =~ ^[0-9]+$ ]] || ngames=0
+    if [[ $ngames -eq 0 ]]; then
+      echo -e "set label6 ~     traduzione in JSON non riuscita\nhide progress1\nhide button1\nshow vbox2\nshow button2" >$fcmd
+      return
+    fi
+
+    # ~~ processo 4/5
+    [[ -f $fabort ]] && return
+    echo "~ <b>4</b>/5 - integrazione dati aggiuntivi nel documento JSON..." >${dtmp}/win3_label4
+
+    # conteggi partite, in stringa e con 'grouping'
+    local ngames_src="$( grep -sic -- '^\[Event\s' "$dialog_chooser1" )"
+    if [[ $ngames_src =~ ^[0-9]+$ && $ngames -lt $ngames_src ]]; then
+      # il numero partite si è ridotto: riporto sia numero importato che numero in sorgente
+      ngames="$( LC_ALL=en_US.UTF-8 printf "%'.f\n" $ngames )"
+      ngames_src="$( LC_ALL=en_US.UTF-8 printf "%'.f\n" $ngames_src )"
+      ngames="${ngames}/${ngames_src}"
+    else
+      ngames="$( LC_ALL=en_US.UTF-8 printf "%'.f\n" $ngames )"
+    fi
+
+    # assemblo $fjson_tmp; ordino alfabeticamente l'array "games[]" in base al valore delle key "White"
+    jq -sc --arg date "$( date +'%Y.%m.%d' )" --arg time "$( date +'%s' )" --arg fhash "$fhash" --arg fname "${dialog_chooser1##*/}" --arg ngames "${ngames//,/.}" \
+      --slurpfile games $fgames '{"date": $date, "time": $time, "fhash": $fhash, "fname": $fname, "ngames": $ngames, "games": ($games | .[] | sort_by(.White))}' >$fjson_tmp 2>${flog}
+    ec=$?
+    if [[ $ec -eq 0 ]]; then
+      # libero subito spazio tmpfs
+      rm -f $fgames
+    else
+      # $fjson_tmp assemblato CON errori!
+      echo -e "set label6 ~     ERRORE: il programma  <tt>jq</tt>  è uscito con codice ${ec}\nhide progress1\nhide button1\nshow vbox2\nshow button2" >$fcmd
+      return
+    fi
+
+    # ~~ processo 5/5
+    [[ -f $fabort ]] && return
+    echo "~ <b>5</b>/5 - trasferimento dei file PGN e JSON definitivi nell'archivio '${pname}'..." >${dtmp}/win3_label4
+
+    # sposto i file ottenuti da $dtmp a $ddb
+    local fpgn="${ddb}/${fhash}.pgn"
+    local fjson="${ddb}/${fhash}.json"
+
+    # sposto il file PGN
+    mv -f $fpgn_tmp "$fpgn"
+    ec=$?
+    if [[ $ec -ne 0 ]]; then
+      echo -e "set label6 ~     ERRORE: il comando  <tt>mv</tt>  è uscito con codice ${ec}\nhide progress1\nhide button1\nshow vbox2\nshow button2" >$fcmd
+      [[ -e $fpgn ]] && rm -f "$fpgn"
+      return
+    fi
+
+    # sposto il file JSON
+    mv -f $fjson_tmp "$fjson"
+    ec=$?
+    if [[ $ec -ne 0 ]]; then
+      echo -e "set label6 ~     ERRORE: il comando  <tt>mv</tt>  è uscito con codice ${ec}\nhide progress1\nhide button1\nshow vbox2\nshow button2" >$fcmd
+      [[ -e $fpgn ]] && rm -f "$fpgn"
+      [[ -e $fjson ]] && rm -f "$fjson"
+      return
+    fi
+
+    # win3: close
+    [[ -p $fcmd ]] && echo "close" >$fcmd
+
+    # aggiorno win1_list1
+    archive_list "$dtmp" "${ddb}" "$fhash"
+  }; export -f archive_import
+function archive_list { # visualizza quanto presente nella directory-archivio $ddb
+    # init params
+    local dtmp=$1 # directory temporanea
+    local ddb="$2" # directory archivio
+    local asel=$3 # [opzionale] se presente, nella lista aggiornata ci sarà auto-selezione di questo elemento
+
+    # init file temporanei
+    local flist=${dtmp}/win1_list1
+    local flist_tmp=${flist}_tmp; [[ -e $flist_tmp ]] && rm -f $flist_tmp
+    local fcmd=${dtmp}/win1_cmd
+
+    # predispongo il dialogo
+    echo -e "set viewer1 ${dtmp}/win1_viewer1_empty\ndisable viewer1\ndisable freebutton3\ndisable freebutton2\ndisable freebutton4" >$fcmd
+    echo '^lista in preparazione....' >$flist
+
+    # file JSON sono presenti?
+    declare ajson=( $( find "${ddb}" -mindepth 1 -maxdepth 1 -name "*.json" ) )
+    if [[ ${#ajson[@]} -gt 0 ]]; then
+      # in $items memorizzo i dati identificativi da ciascun file JSON presente in $ddb, che ordino a partire dal più recente
+      # NOTA: l'eventuale mancata presenza del complementare file PGN la gestirò solo in seguito (..)
+      local items="$( jq -sr '.[] | "\(.time)|\(.fhash)|\(.date)|\(.fname)|\(.ngames)"' "${ddb}/"*.json | sort -t'|' -k1,1nr )"
+      # conteggio righe risultanti
+      local nitems="$( wc -l <<<"$items" )"; [[ $nitems =~ ^[0-9]+$ ]] || nitems=0
+
+      # se $items conta almeno un elemento, costruisco la lista
+      if [[ $nitems -gt 0 ]]; then
+        # col0: fhash
+        echo "^HIDE" >$flist_tmp
+        gawk -F'|' '{print $2}' <<<"$items" >>$flist_tmp
+
+        # col1: date
+        echo -e "^inserito\n--colwidth=56" >>$flist_tmp
+        gawk -F'|' '{print $3}' <<<"$items" >>$flist_tmp
+
+        # col2: fname
+        echo -e "^nome file di origine\n--colwidth=304" >>$flist_tmp
+        gawk -F'|' '{print $4}' <<<"$items" >>$flist_tmp
+
+        # col3: ngames
+        echo -e "^numero partite\n--colwidth=96" >>$flist_tmp
+        gawk -F'|' '{print $5}' <<<"$items" >>$flist_tmp
+      fi
+
+      # aggiorno il dialogo
+      if grep -qsE -m1 -- '^[[:xdigit:]]+$' $flist_tmp; then
+        # ho ottenuto la lista
+        echo "$( <$flist_tmp )" >$flist; rm -f $flist_tmp
+        echo -e "set label4 ${nitems}\nenable freebutton3" >$fcmd
+        [[ $asel =~ ^[[:xdigit:]]+$ ]] && { sleep 0.2s; echo "select list1 ${asel}" >$fcmd; }
+      else
+        # errore!
+        echo "^❢ [ERRORE] costruzione lista non riuscita" >$flist
+        echo -e "set label4 ?\nenable freebutton3" >$fcmd
+      fi
+    else
+      # nessun JSON in archivio
+      echo "^❢ l'archivio è vuoto" >$flist
+      echo -e "set label4 0\nenable freebutton3" >$fcmd
+    fi
+  }; export -f archive_list
+function archive_delete { # previa conferma, rimuove un PGN archiviato
+    # init params
+    local pname=$1 # nome programma
+    local dtmp=$2 # directory temporanea
+    local dprg="$3" # directory programma
+    local ddb="$4" # directory archivio
+    local hash=$5 # elemento selezionato
+
+    echo -e "disable hbox2" >${dtmp}/win1_cmd
+
+    # è confermato?
+    local msg="<span foreground='#AF2A2A'><big><b>Eliminare il file selezionato</b> ??  </big></span>"
+    if [[ $( "rq" -w "$pname" -t "conferma... - ${pname}" -i "user-trash-full-symbolic" -p -0 'yes' -1 'no' "$msg" 2>/dev/null ) -eq 0 ]]; then
+      # rimuovo i due file PGN+JSON e aggiorno il dialogo
+      rm -f "${ddb}/${hash}.pgn" "${ddb}/${hash}.json"
+      echo "press freebutton3" >${dtmp}/win1_cmd
+    fi
+
+    echo -e "enable hbox2" >${dtmp}/win1_cmd
+  }; export -f archive_delete
+
+function games_list { # estrae e mostra nel dialogo i TAG principali da tutte le partite
+    # init params
+    local dtmp=$1 # directory temporanea
+    local ddb="$2" # directory archivio
+    local current=$3 # hash file archivio correntemente aperto
+    local sel=$4 # hash file archivio selezionato
+
+    # inibisco il bottone di richiamo
+    echo "disable freebutton4" >${dtmp}/win1_cmd
+
+    # se precedente e attuale selezione file archivio non differiscono, non devo rigenerare la lista
+    if [[ $sel == "$current" ]]; then
+      echo -e "hide vbox1\nshow vbox6" >${dtmp}/win1_cmd
+      return
+    fi
+
+    # init file temporanei
+    local flist=${dtmp}/win1_list2
+    local flist_tmp=${flist}_tmp; [[ -e $flist_tmp ]] && rm -f $flist_tmp
+
+    # predispongo il dialogo, riporto nome file selezionato e numero partite incluse
+    local fname= ngames=
+    eval "$( jq -r '@sh "fname=\(.fname);ngames=\(.ngames)"' "${ddb}/${sel}.json" 2>/dev/null )"
+    echo -e "disable freebutton6\ndisable freebutton7\nset label6 ${fname}\nset label7 ${sel}\nset label8 ${ngames}\nhide vbox1\nshow vbox6" >${dtmp}/win1_cmd
+    echo '^lista in preparazione....' >$flist
+
+    # costruisco la lista
+    jq -sr '.[].games | "^HIDE", .[].HashCode,
+      "^data\n--colwidth=72", .[].Date,
+      "^giocatore BIANCO ♔\n--colwidth=208", .[].White,
+      "^giocatore NERO ♚\n--colwidth=208", .[].Black,
+      "^turno\n--colwidth=50", .[].Round,
+      "^risultato\n--colwidth=64", .[].Result,
+      "^ELO ♔\n--colwidth=50", .[].WhiteElo,
+      "^ELO ♚\n--colwidth=50", .[].BlackElo,
+      "^ECO\n--colwidth=50", .[].ECO,
+      "^nome e luogo evento\n--colwidth=272", (.[] | "\(.Event), \(.Site)")' "${ddb}/${sel}.json" 2>/dev/null | sed 's/^null$/?/' >$flist_tmp
+
+    # aggiorno il dialogo
+    if [[ -s $flist_tmp ]]; then
+      echo "$( <$flist_tmp )" >$flist; rm -f $flist_tmp
+    else
+      echo "^❢❲PROBABILE ERRORE❳ la lista è vuota" >$flist
+    fi
+  }; export -f games_list
+
+function game_data { # apre il dialogo separato win4 che riporta il formato PGN integrale
+    # init params
+    local pname=$1 # nome programma
+    local dtmp=$2 # directory temporanea
+
+    # inibisco il bottone di richiamo
+    echo "disable freebutton6" >${dtmp}/win1_cmd
+
+    # init file temporanei
+    local fgame=${dtmp}/current.pgn
+
+    # win4: init
+    local fviewer1=${dtmp}/win4_viewer1_empty
+    >$fviewer1
+    if grep -qsi -m1 -- '^\[hashcode\s' ${dtmp}/current.pgn; then
+      fviewer1=${dtmp}/current.pgn
+    fi
+    # named-pipe
+    local fcmd=${dtmp}/win4_cmd
+    [[ -e $fcmd ]] && rm -f $fcmd
+    mkfifo $fcmd
+
+    # win4: open
+    spacefm --dialog \
+      --window-size "320x720 2" --title "notazione - ${pname}" --window-icon "$pname" \
+      --label --nowrap --font '9' "~<span foreground='#06535E'>♖ file:</span>  <b><tt>${fgame//_/__}</tt></b>" \
+      --hsep \
+      --viewer --font 'monospace bold 11' $fviewer1 \
+      --command $fcmd >/dev/null 2>&1
+    rm -f $fcmd
+
+    # ripristino il bottone di richiamo
+    echo "enable freebutton6" >${dtmp}/win1_cmd
+  }; export -f game_data
+function game_play { # apre la partita corrente nel programma PGNviewer3D
+    # init params
+    local dtmp=$1 # directory temporanea
+    local dprg="$2" # directory programma
+
+    # programma PGNviewer3D eseguibile?
+    if [[ -x ${dprg}/PGNviewer3D.x86_64 ]]; then
+      # inibisco bottone di richiamo
+      echo "disable freebutton7" >${dtmp}/win1_cmd
+
+      # verifico che esista la cartella temp nella cartella utente di Godot
+      if [ ! -d /home/"$USER"/.local/share/godot/app_userdata/PGNviewer3D/temp ]; then
+        # se non c'è la creo
+        mkdir -m 0700 /home/"$USER"/.local/share/godot/app_userdata/PGNviewer3D/temp;
+      fi
+      # copio la partita selezionate nella cartella temp
+      cp -af ${dtmp}/current.pgn /home/"$USER"/.local/share/godot/app_userdata/PGNviewer3D/temp
+      # lancio programma animazione 3D
+      if pgrep -x 'PGNviewer3D.x86_64' >/dev/null 2>&1; then
+        xdotool windowactivate --sync $( xdotool search --sync --name '^PGNviewer3D.x86_64$' ) && xdotool key F12
+      else
+        "${dprg}/PGNviewer3D.x86_64"
+      fi
+      # ripristino bottone
+      echo "enable freebutton7" >${dtmp}/win1_cmd
+    fi
+  }; export -f game_play
+
+function win1_clicked { # singolo click in win1_list1 o win1_list2
+    # init params; se non sono quelli attesi, esco subito
+    local pname=$1 # nome programma
+    local dtmp=$2 # directory temporanea
+    local dprg="$3" # directory programma
+    local ddb="$4" # directory archivio
+    local current=$5 # hash file archivio correntemente aperto
+    local widget=${6%% *}; [[ $widget =~ ^list[1-2]$ ]] || return
+    local value=${6#*  }; [[ $value =~ ^[[:xdigit:]]+$ ]] || return
+
+    # azione
+    case $widget in
+      list1) # visualizzo lo storico degli incontri
+        echo -e "set viewer1 ${dtmp}/win1_viewer1_empty\nenable freebutton2\nenable freebutton4" >${dtmp}/win1_cmd
+        >${dtmp}/win1_viewer1
+        jq -sr '.[] | .games[] | "\(.Date | split(".") | first)  ♗\(.White)  ♝\(.Black)   ⧼\(.Event), \(.Site)⧽"' "${ddb}/${value}.json" >${dtmp}/win1_viewer1 2>/dev/null
+        [[ -s ${dtmp}/win1_viewer1 ]] && echo -e "enable viewer1\nset viewer1 ${dtmp}/win1_viewer1" >${dtmp}/win1_cmd || echo "disable viewer1" >${dtmp}/win1_cmd
+        ;;
+
+      list2) # estraggo la singola partita nel file temporaneo $fgame; se win4 (function 'game_data{}') è aperta, vi mostro i contenuti di $fgame
+        echo -e "disable freebutton6\ndisable freebutton7" >${dtmp}/win1_cmd
+        [[ -p ${dtmp}/win4_cmd ]] && echo "set viewer1 ${dtmp}/win4_viewer1_empty" >${dtmp}/win4_cmd
+        local fpgn="${ddb}/${current}.pgn"
+        local fgame=${dtmp}/current.pgn; [[ -e $fgame ]] && rm -f $fgame
+        local msg=
+
+        # se trovo $fpgn, eseguo l'estrazione
+        if [[ -s $fpgn ]]; then
+          pgn-extract --quiet -Th${value} --stopafter 1 -w30 -o${fgame} -l${dtmp}/export.log "$fpgn"
+
+          # estrazione riuscita?
+          if grep -qsi -m1 -- '^\[hashcode\s' $fgame; then
+            [[ -p ${dtmp}/win4_cmd ]] && echo "set viewer1 ${fgame}" >${dtmp}/win4_cmd || echo "enable freebutton6" >${dtmp}/win1_cmd
+
+            # programma PGNviewer3D in esecuzione?
+            if pgrep -x 'PGNviewer3D.x86_64' >/dev/null 2>&1; then
+              # sì: porto il focus sulla finestra del programma e simulo la pressione hotkey che inizializza la partita
+              xdotool windowactivate --sync $( xdotool search --sync --name '^PGNviewer3D.x86_64$' ) && xdotool key --delay 200 F12
+              echo "il programma è in esecuzione"
+            else
+              # no: se l'eseguibile è presente, abilito il bottone che consente di avviarlo
+              [[ -x ${ddb%/*}/PGNviewer3D.x86_64 ]] && echo "enable freebutton7" >${dtmp}/win1_cmd
+              echo "il programma non è in esecuzione"
+            fi
+          else
+            msg="<tt>file: <b>${current}</b>    \ngame: <b>${value}</b></tt>\n\n<span foreground='#AF5858'><big><b>❢ estrazione della singola partita non riuscita</b>  </big></span>"
+          fi
+        else
+          msg="<b><tt>GAMES/${fpgn##*/}</tt></b>    \n\n<span foreground='#AF5858'><big><b>❢ file non trovato</b>  </big></span>"
+        fi
+
+        # eventualmente segnalo il problema; se aperta, prima chiudo win4
+        if [[ -n $msg ]]; then
+          [[ -p ${dtmp}/win4_cmd ]] && echo "close" >${dtmp}/win4_cmd
+          "${dprg}/rq" -w "$pname" -t "problema... - ${pname}" -i "error" -p -0 'close' "$msg" 2>/dev/null
+        fi
+    esac
+  }; export -f win1_clicked
+
+
+## init
+original_Path="$PATH"
+export PATH="/opt/PGNviever3D/temp:${PATH}"
+pname="${0##*/}"
+dprg="${0%/*}"
+dtmp="${dprg}/temp"; [[ -d $dtmp ]] || mkdir -m 0700 $dtmp
+ddb="${dprg}/GAMES"; [[ -d $ddb ]] || mkdir -m 0700 "$ddb"
+
+## main
+# win1: init
+echo '^' >${dtmp}/win1_list1
+echo '^' >${dtmp}/win1_list2
+>${dtmp}/win1_viewer1_empty
+# named-pipe
+[[ -e ${dtmp}/win1_cmd ]] && rm -f ${dtmp}/win1_cmd
+mkfifo ${dtmp}/win1_cmd
+
+# win1: open
+spacefm --dialog \
+  --window-size "1280x720 2" --title "$pname" --window-icon "$pname" \
+  --vbox 0 \
+    --hbox 0 \
+      --vbox --compact 0 \
+        --label --nowrap --font '9' "~<span foreground='#452800'>♕ <i>\"Portable Game Notation\"</i> importati...</span>\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t" \
+        --list --font '12' @${dtmp}/win1_list1 -- noop \
+      --close-box \
+      --vsep \
+      --vbox 0 \
+        --label --nowrap --font '9' "~<span foreground='#452800'>♙ Storico degli incontri...</span>" \
+        --viewer --font '10' ${dtmp}/win1_viewer1_empty \
+      --close-box \
+    --close-box \
+    --hsep \
+    --hbox --compact 4 \
+      --label --nowrap --font '15' "~<span foreground='#9C3400'>♖ FILE IN ARCHIVIO</span> " \
+      --label --nowrap --font 'monospace 12' "  " \
+      --vbox --close-box \
+      --free-button " Aggiungi file PGN :list-add" -- bash -c "archive_import '${pname}' '${dtmp}' '${ddb}'" \
+      --free-button " Elimina dall'archivio :user-trash-full-symbolic" -- bash -c "archive_delete '${pname}' '${dtmp}' '${dprg}' '${ddb}' %list1" \
+      --free-button " Rilettura :view-refresh-symbolic" -- bash -c "archive_list '${dtmp}' '${ddb}'" \
+      --vbox --close-box \
+      --free-button " PARTITE... :emblem-documents-symbolic" -- bash -c "games_list '${dtmp}' '${ddb}' '%label7' %list1" \
+      --vsep \
+      --free-button "Chiudi :window-close-symbolic" -- close \
+    --close-box \
+  --close-box \
+  --vbox 0 \
+    --hbox --compact 4 \
+      --label --nowrap --font '9' "~<span foreground='#452800'>♕ file:</span>" \
+      --label --nowrap --font 'monospace bold 13' "ffsd" \
+      --label "" \
+      --vbox --close-box \
+      --label --nowrap --font 'monospace bold 12' "ffsd" \
+      --label --nowrap --font '9' "~<span foreground='#452800'>partite ♙</span>" \
+    --close-box \
+    --list --font '12' @${dtmp}/win1_list2 -- bash -c "[[ -p ${dtmp}/win4_cmd ]] || echo 'press freebutton6' >${dtmp}/win1_cmd" \
+    --hsep \
+    --hbox --compact 4 \
+      --label --nowrap --font '15' "~<span foreground='#004F82'>♘ PARTITE CON RISULTATO E PUNTEGGI</span>" \
+      --vbox --close-box \
+      --free-button " Notazione PGN :view-list-symbolic" -- bash -c "game_data '${pname}' '${dtmp}'" \
+      --free-button " RIVEDI MOSSE in 3D :application-x-blender" -- bash -c "game_play '${dtmp}' '${dprg}'" \
+      --vbox --close-box \
+      --free-button " ARCHIVIO... :system-file-manager-symbolic" -- bash -c "[[ -p ${dtmp}/win4_cmd ]] && echo 'close' >${dtmp}/win4_cmd" \
+        -- hide vbox6 -- show vbox1 -- enable freebutton4 \
+      --vsep \
+      --free-button "Chiudi :window-close-symbolic" -- close \
+    --close-box \
+  --close-box \
+  --click -- bash -c "win1_clicked '${pname}' '${dtmp}' '${dprg}' '${ddb}' '%label7' '%v'" \
+  --command ${dtmp}/win1_cmd -- hide label7 -- press freebutton8 -- press freebutton3 >/dev/null 2>&1
+rm -f ${dtmp}/win1_cmd
+
+## finis
+pkill -x PGNviewer3D.x86_64 >/dev/null 2>&1
+for i in 2 3 4; do
+  [[ -p ${dtmp}/win${i}_cmd ]] && echo "close" >${dtmp}/win${i}_cmd
+done
+export PATH="$original_Path"
+exit 0
